@@ -1,0 +1,22 @@
+﻿  disassembler.cpp
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\disassembler.hpp(2,10): fatal error C1083: 포함 파일을 열 수 없습니다. 'capstone/capstone.h': No such file or directory
+  instruction.cpp
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\instruction.hpp(2,10): fatal error C1083: 포함 파일을 열 수 없습니다. 'capstone/capstone.h': No such file or directory
+  instruction_stream.cpp
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\instruction.hpp(2,10): fatal error C1083: 포함 파일을 열 수 없습니다. 'capstone/capstone.h': No such file or directory
+  main.cpp
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\instruction.hpp(2,10): fatal error C1083: 포함 파일을 열 수 없습니다. 'capstone/capstone.h': No such file or directory
+  module_view.cpp
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\winpe\dir_relocs.hpp(33,78): warning C4244: 'return': '__int64'에서 'uint32_t'(으)로 변환하면서 데이터가 손실될 수 있습니다.
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\module_view.cpp(67,12): warning C4102: 'cleanup': 참조되지 않은 레이블입니다.
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\winpe\image.hpp(63,55): warning C4018: '<=': signed 또는 unsigned가 일치하지 않습니다.
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\winpe\image.hpp(61): message : 클래스 템플릿 멤버 함수 'win::data_directory_t *win::image_t<true>::get_directory(win::directory_id)'을(를) 컴파일하는 중입니다.
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\module_view.cpp(87): message : 컴파일되는 함수 템플릿 인스턴스화 'win::data_directory_t *win::image_t<true>::get_directory(win::directory_id)'에 대한 참조를 확인하세요.
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\module_view.cpp(87): message : 컴파일되는 클래스 템플릿 인스턴스화 'win::image_t<true>'에 대한 참조를 확인하세요.
+  pe_constructor.cpp
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\winpe\dir_relocs.hpp(33,78): warning C4244: 'return': '__int64'에서 'uint32_t'(으)로 변환하면서 데이터가 손실될 수 있습니다.
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\pe_constructor.cpp(112,54): warning C4267: '=': 'size_t'에서 'uint32_t'(으)로 변환하면서 데이터가 손실될 수 있습니다.
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\pe_constructor.cpp(114,80): warning C4267: '=': 'size_t'에서 'uint32_t'(으)로 변환하면서 데이터가 손실될 수 있습니다.
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\pe_constructor.cpp(115,56): warning C4267: '=': 'size_t'에서 'uint32_t'(으)로 변환하면서 데이터가 손실될 수 있습니다.
+  GUARD.cpp
+C:\Users\s3\Desktop\workspace\GUARD-master\GUARD-master\GUARD\instruction.hpp(2,10): fatal error C1083: 포함 파일을 열 수 없습니다. 'capstone/capstone.h': No such file or directory

@@ -1,0 +1,564 @@
+#include "disassembler.hpp"
+#include <unicorn/unicorn.h>
+#include "imports.hpp"
+#include "GUARD.hpp"
+#include <windows.h>
+#define X86_CODE32 "\xe8\x6\xfd\xff\xff" // xor  eax, eax
+
+namespace GUARD
+{
+    // Disassembles at the offset from the base, negotating jumps according to the flags.
+    // NOTE: The offset is used for the disassembled instructions' addresses.
+    // If the number of instructions disassembled exceeds the provided max amount, en empty instruction stream is returned.
+    //
+
+    uc_err err;
+    uint64_t ea;
+    uint64_t base, offset;
+    std::vector<BYTE> bytecodes;
+    uint64_t sec_size;
+    size_t size_prev_fetch = 0xFFFFFFFFFFFFFFFFull;;
+
+    uint64_t ins_count = 0;
+    uint64_t start_address;
+    uint64_t current_address;
+    uint64_t return_address;
+
+    GUARD::iat_info temp_iat_info{};
+
+
+    csh handle_prev;
+    cs_insn* insn_prev_fetch;
+    // Retrieves the module base from the given remote ea.
+//
+    void resolve_undirect_operands(auto insn, std::unique_ptr<module_view> const* target_module_view, uint64_t start_offset, auto current_address_option, uc_engine* uc) {
+        auto ins = std::make_shared<instruction>(insn);
+        uint8_t num_operand = ins->operand_count();
+
+        for (int i = 0; i < num_operand; i++) {
+            if (ins->operand(i).type == X86_OP_MEM) {
+
+                if (ins->operand(i).access == 1) {
+                    if (ins->operand_type(i) == X86_OP_MEM) {
+                        //printf("\n%x : %s %s : it has %d operand \n\n", ins->ins.address, ins->ins.mnemonic, ins->ins.op_str, num_operand);
+
+                        uint64_t target_memory_address;
+                        uint64_t mem_value_sum;
+                        uint32_t base_reg_idx, index_reg_idx;
+                        uint32_t base_reg_value, index_reg_value;
+                        uint32_t eip;
+                        base_reg_idx = ins->operand(i).mem.base; index_reg_idx = ins->operand(i).mem.index;
+
+
+
+
+                        printf("emulation1 from %x until %x\n", start_address, ins->ins.address);
+
+                        if (start_address != ins->ins.address) {
+                            err = uc_emu_start(uc, start_address, ins->ins.address, 0, 0);
+                            if (err) {
+                                printf("Failed6 on uc_emu_start() with error returned %u: %s\n", err, uc_strerror(err));
+                                break;
+                            }
+                            ins_count = 0;
+                        }
+                        if (base_reg_idx == X86_REG_INVALID) {
+                            base_reg_value = 0;
+                        }
+                        else if (uc_reg_read(uc, base_reg_idx, &base_reg_value)) {
+                            printf("Failed to read emulation code1 to memory, quit!\n");
+                        }
+                        if (index_reg_idx == X86_REG_INVALID) {
+                            index_reg_value = 0;
+                        }
+                        else if (uc_reg_read(uc, index_reg_idx, &index_reg_value)) {
+                            printf("Failed to read emulation code2 to memory, quit!\n");
+                        }
+
+                        mem_value_sum = base_reg_value + index_reg_value * ins->operand(i).mem.scale + ins->operand(i).mem.disp;
+                        /*
+                        printf("index reg value is %x\n", index_reg_value);
+                        printf("base reg value is %x\n", base_reg_value);
+                        printf("\n####calculated value is %x after emulation\n\n", mem_value_sum);
+                        */
+                        if (strcmp(ins->ins.mnemonic, "lea") != 0) {
+                            /*
+                            printf("\n####segment imm : %x, base : %x, index : %x, scale : %x, disp : %x  \n\n", ins->operand(i).mem.segment, ins->operand(i).mem.base,
+                                ins->operand(i).mem.index, ins->operand(i).mem.scale, ins->operand(i).mem.disp);*/
+
+                            if (mem_value_sum >= start_offset && mem_value_sum <= (start_offset + (*target_module_view)->module_size)) {
+
+                                auto section = (*target_module_view)->local_module.get_image()->rva_to_section(mem_value_sum);
+                                //printf("mnemonic is %s \n", ins->ins.mnemonic);
+
+
+
+                                if (section->name != NULL) {
+                                    if ((strcmp(section->name, ".vmp0") == 0 || strcmp(section->name, ".vmp1") == 0) && strcmp(ins->ins.mnemonic, "mov") == 0) {
+                                        temp_iat_info.thunk_rva = mem_value_sum;
+                                        //printf("thunk rva is %x\n", temp_iat_info.thunk_rva);
+
+                                        uint32_t zero = 0;
+                                        if (uc_mem_write(uc, mem_value_sum, &zero, sizeof(mem_value_sum))) {
+                                            printf("Failed to write emulation code to memory, quit!\n");
+                                        }
+                                    }
+                                }
+                                uint32_t temp_mem_value;
+                                if (uc_mem_read(uc, mem_value_sum, &temp_mem_value, sizeof(temp_mem_value))) {
+                                    printf("Failed to read emulation code to memory, quit!\n");
+                                }
+
+                                //printf("[%x] is %x\n", mem_value_sum, temp_mem_value);
+                            }
+
+                        }
+                        if (uc_reg_read(uc, UC_X86_REG_EIP, &eip)) {
+                            printf("Failed to read emulation code5 to memory, quit!\n");
+                        }
+
+                        //printf("eip is %x\n", eip);
+
+                        if (eip != start_address) {
+                            //printf("start1 address changed %x to %x\n", start_address, eip);
+                            start_address = current_address = eip;
+                            offset = eip;
+                            ea = base + offset;
+                        }
+                        else {
+                            if (current_address_option == 0) {
+                                size_t count;
+
+                                uint64_t ea_prev_fetch = base + ins->ins.address + ins->ins.size;
+
+                                resolve_next_address(base, ins, ea_prev_fetch);
+
+                            }
+                            //printf("emulation start from %x to 1 instruction\n", start_address);
+                            err = uc_emu_start(uc, start_address, 0, 0, 1);
+                            if (err) {
+                                printf("Failed1 on uc_emu_start() with error returned %u: %s\n", err, uc_strerror(err));
+                                break;
+                            }
+                            if (uc_reg_read(uc, UC_X86_REG_EIP, &eip)) {
+                                printf("Failed to write emulation code to memory, quit!\n");
+                            }
+                            //printf("start2 address changed %x to %x\n", start_address, eip);
+                            start_address = current_address = eip;
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    void resolve_next_address(auto base, auto ins, uint64_t ea_prev_fetch) {
+        //csh handle_prev;
+        uint64_t virtual_address = ea_prev_fetch - base;
+        //printf("fetch start... %x\n", virtual_address);
+        if (!cs_disasm_iter(handle_prev, (const uint8_t**)&ea_prev_fetch, &size_prev_fetch, &virtual_address, insn_prev_fetch))
+        {
+            printf("fail. invalid\n");
+            return;
+        }
+
+        /*
+        printf("\nnext address candidate is %x : %s and size : %d\n", (insn_prev_fetch)->address, (insn_prev_fetch)->mnemonic, (insn_prev_fetch)->size);
+        printf("ins operand test : %d ", (insn_prev_fetch)->detail->x86.operands[0].type);
+
+        printf("\nmem6 write from %x to %x : ", (insn_prev_fetch)->address, (insn_prev_fetch)->address + (insn_prev_fetch)->size);
+        */
+
+
+        //printf(" successfully\n");
+    }
+
+    GUARD::iat_info disassembler::disassemble_32(uint64_t _base, uint64_t _offset, std::unique_ptr<module_view> const* target_module_view, uint64_t start_offset, uint64_t next_address,
+        uint32_t code_size, uc_engine* uc, disassembler_flags flags, uint64_t max_instructions)
+    {
+        base = _base;
+        offset = _offset;
+        ea = base + offset;
+
+        ZeroMemory(&temp_iat_info.dest_op, sizeof(temp_iat_info)); // ������ ���� �ʱ�ȭ
+
+        //
+        uint64_t* ea_ptr = (uint64_t*)ea;
+
+        std::vector<std::shared_ptr<instruction>> instructions;
+
+
+        size_t size = 0xFFFFFFFFFFFFFFFFull;
+
+        sec_size = (*target_module_view)->module_size;
+        //printf("module size is %x\n", sec_size);
+
+        uint64_t i = 0;
+        // 32bit ����
+        uint8_t bitoffset = 4;
+
+        bool prev_fetch_skip_flag = false;
+        // 32bit ����
+        if (cs_open(CS_ARCH_X86, CS_MODE_32, &handle_prev)) {
+            printf("ERROR: Failed to initialize engine!\n");
+        }
+        cs_option(handle_prev, CS_OPT_DETAIL, CS_OPT_ON);
+        insn_prev_fetch = cs_malloc(handle_prev);
+        // 32bit ����
+        err = uc_open(UC_ARCH_X86, UC_MODE_32, &uc);
+        if (err != UC_ERR_OK) {
+            printf("Failed on uc_open() with error returned: %u\n", err);
+        }
+
+        // Helper lambda to exception-wrap the disassebly.
+        // This is useful as we may be dealing with invalid instructions which may cause an access violation.
+        //
+        auto disasm = [&]() -> bool
+        {
+            __try
+            {
+                return cs_disasm_iter(handle, (const uint8_t**)&ea, &size, &offset, insn);
+            }
+            __except (1) {}
+            return false;
+        };
+
+        // While iterative disassembly is successful.
+        //
+
+        auto ins_start = std::make_shared<instruction>(insn);
+        ins_count = 0;
+        start_address = ins_start->operand(0).imm;
+        current_address = start_address;
+        return_address = insn->address + 5;
+        bool firstflag = true;
+        //printf("start_offset is %x\n", start_offset);
+        uc_mem_map(uc, 0x1000, sec_size + 0x1000, UC_PROT_ALL);
+
+        while (disasm())
+        {
+            // Check max bounds.
+            //
+
+            //printf("******************test %x and %x and %x\n", std::begin(insn->bytes), std::begin(insn->bytes) + insn->size, *bytecodes.end());
+            //std::copy(std::begin(insn->bytes), std::begin(insn->bytes) + insn->size, bytecodes.end());
+
+            // Construct a self-containing instruction.
+            //
+            auto ins = std::make_shared<instruction>(insn);
+
+            uint32_t esp_addr = sec_size;
+            uint32_t eip;
+            if (firstflag) {
+                uc_reg_write(uc, UC_X86_REG_ESP, &esp_addr);
+                //printf("rsp value to save is %x\n", esp_addr);
+                if (uc_mem_write(uc, esp_addr, &return_address, sizeof(return_address))) {
+                    printf("Failed to write emulation code to memory, quit!\n");
+                }
+                /*
+                uint64_t next_stackp = rsp_addr - bitoffset;
+
+                printf("next_stack_pointer is %x\n", next_stackp);
+
+                uc_reg_write(uc, UC_X86_REG_ESP, &next_stackp);
+
+                if (uc_mem_write(uc, next_stackp, &return_address, sizeof(return_address) - 1)) {
+                    printf("Failed to write emulation code to memory, quit!\n");
+                }*/
+                //printf(" return address rva is %x\n", return_address);
+                uint32_t temp_rsp_value;
+                if (uc_mem_read(uc, esp_addr, &temp_rsp_value, sizeof(return_address))) {
+                    printf("Failed to write emulation code to memory, quit!\n");
+                }
+
+                //printf("stored size is %x in %x\n", temp_rsp_value, esp_addr);
+
+                firstflag = false;
+            }
+
+            bytecodes.insert(bytecodes.end(), std::begin(insn->bytes), std::begin(insn->bytes) + insn->size);
+            resolve_undirect_operands(insn, target_module_view, start_offset, 0, uc);
+            //current_address = ins->ins.address;
+
+            ins_count++;
+            if (i >= max_instructions) {
+                printf("max num exceeds\n");
+                break;
+            }
+            i++;
+            //printf("$$$$ %x : %s %s\n", ins->ins.address, ins->ins.mnemonic, ins->ins.op_str);
+
+
+            // Is the instruction a branch?
+            //
+            if (ins->is_branch())
+            {
+                // If it's unconditional, and we know the destination, and we are specified
+                // to follow these types of jumps, do so.
+                //
+                if (flags & disassembler_take_unconditional_imm
+                    && ins->is_uncond_jmp() && ins->operand(0).type == X86_OP_IMM)
+                {
+                    // We must set the offset, otherwise the disassembly will be incorrect.
+                    //
+                    offset = ins->operand(0).imm;
+
+                    // Update actual disassembly pointer.
+                    //
+                    ea = offset + base;
+
+                    // Don't append the jump to the stream.
+                    //
+
+                    current_address = ins->operand(0).imm;
+                    //printf("now rip is %x and inscount is %d\n", start_address, ins_count);
+                    continue;
+                }
+
+                /*
+                for (size_t i = 0; i < bytecodes.size(); ++i) {
+                    printf("%x ", bytecodes[i]);
+                }*/
+                current_address = ins->ins.address;
+
+                size_t count;
+
+                uint64_t ea_prev_fetch_jump = base + ins->operand(0).imm;
+                uint64_t ea_prev_fetch_not_jump = base + ins->ins.address + ins->ins.size;
+                resolve_next_address(base, ins, ea_prev_fetch_jump);
+                resolve_next_address(base, ins, ea_prev_fetch_not_jump);
+                //cs_free(insn_prev_fetch, 1);
+
+                //printf("\n\n resume start address : %x and current_address : %x\n\n ", start_address, current_address);
+
+                err = uc_emu_start(uc, start_address, current_address, 0, 0);
+                if (err) {
+                    printf("Failed2 on uc_emu_start() with error returned %u: %s\n", err, uc_strerror(err));
+                    break;
+                }
+                uint32_t prev_eip;
+                if (uc_reg_read(uc, UC_X86_REG_EIP, &prev_eip))
+                    printf("error fallure");
+                //printf("prev rip is %x \n", prev_eip);
+
+                err = uc_emu_start(uc, current_address, 0, 0, 1);
+                if (err) {
+                    printf("Failed3 on uc_emu_start() with error returned %u: %s\n", err, uc_strerror(err));
+                    break;
+                }
+
+
+                if (uc_reg_read(uc, UC_X86_REG_EIP, &eip))
+                    printf("error fallure");
+                //printf("rip is %x \n\n", eip);
+
+                // Branch not resolved - simply end disassembly.
+                //
+                //printf("start3 address changed %x to %x\n", start_address, eip);
+                start_address = current_address = eip;
+                ins_count = 0;
+                offset = eip;
+                ea = eip + base;
+                continue;
+            }
+
+            // Is the instruction a call?
+            //
+            if (ins->ins.id == X86_INS_CALL)
+            {
+                // If the pass calls flag is not set, add it and end disassembly.
+                //
+                if (!(flags & disassembler_pass_calls))
+                {
+                    // We must set the offset, otherwise the disassembly will be incorrect.
+//
+                    offset = ins->operand(0).imm;
+
+                    // Update actual disassembly pointer.
+                    //
+                    ea = offset + base;
+
+                    instructions.push_back(ins);
+
+                    //printf("current call address from %x\n", current_address);
+                    //printf("byte size is %d\n", bytecodes.size());
+
+                    current_address = ins->operand(0).imm;
+
+                    //printf("emulation 00 from %x to %x\n", start_address, current_address);
+
+                    //32bit ���� ? 64bit���� �̰� �� �־�����?
+                    /*
+                    err = uc_emu_start(uc, start_address, current_address, 0, 0);
+                    if (err) {
+                        printf("Failed on uc_emu_start() with error returned %u: %s\n", err, uc_strerror(err));
+                        break;
+                    }
+
+                    if (uc_reg_read(uc, UC_X86_REG_EIP, &rip))
+                        printf("error fallure");
+                    printf("rip is %x \n\n", rip);
+
+                    printf("start4 address changed %x to %x\n", start_address, rip);
+                    start_address = current_address;*/
+                    continue;
+                    //break;
+                }
+            }
+
+            // Is the instruction a return?
+            //
+
+            if (ins->ins.id == X86_INS_RET)
+            {
+                // Add the instruction and end disassembly.
+                //
+                instructions.push_back(ins);
+
+
+                /*
+                printf("emulation start from : %x and until : %x \n", start_address, ins->ins.address);
+                printf("the number of ins is : %d \n", ins_count);
+                */
+                err = uc_emu_start(uc, start_address, ins->ins.address, 0, 0);
+                if (err) {
+                    printf("Failed4 on uc_emu_start() with error returned %u: %s\n", err, uc_strerror(err));
+
+                    break;
+                }
+
+                uint32_t r_esp, r_eip;
+                uint32_t temp_esp_val1;
+
+                if (uc_reg_read(uc, UC_X86_REG_ESP, &r_esp))
+                    printf("error fallure");
+
+
+                if (uc_mem_read(uc, r_esp, &temp_esp_val1, sizeof(temp_esp_val1))) {
+                    printf("Failed to write emulation code to memory, quit!\n");
+                }
+
+                if (uc_reg_read(uc, UC_X86_REG_EIP, &r_eip))
+                    printf("error fallure");
+                //printf("return address from : %x,\n", r_eip);
+
+                //printf("rsp value : %x,\n", temp_esp_val1);
+
+
+                //auto section_name = (*target_module_view)->local_module.get_image()->rva_to_section(temp_rsp_val1)->name;
+
+                if (temp_esp_val1 >= start_offset && temp_esp_val1 <= (start_offset + (*target_module_view)->module_size)) {
+                    //printf("one more shot\n");
+
+                    size_t count;
+
+                    uint64_t ea_prev_fetch = base + temp_esp_val1;
+                    resolve_next_address(base, ins, ea_prev_fetch);
+                    //cs_free(insn_prev_fetch, 1);
+                    err = uc_emu_start(uc, ins->ins.address, 0, 0, 1);
+                    if (err) {
+                        printf("Failed5 on uc_emu_start() with error returned %u: %s\n", err, uc_strerror(err));
+                        break;
+                    }
+
+
+                    //printf("emulation ended\n");
+
+                    if (uc_reg_read(uc, UC_X86_REG_EIP, &r_eip))
+                        printf("error fallure");
+
+                    // printf("return value : %x,\n", r_eip);
+
+                    if (r_eip >= start_offset && r_eip <= start_offset + code_size) { // it is not call or jmp.. shit..
+                        //printf("not a call or jmp.. : %x,\n", r_eip);
+                        uint32_t reg_vals_indices[] = { UC_X86_REG_EAX, UC_X86_REG_EBP, UC_X86_REG_EBX, UC_X86_REG_ECX, UC_X86_REG_EDI, UC_X86_REG_EDX, UC_X86_REG_ESI };
+                        uint32_t reg_val;
+                        //printf("EAX\tEBP\tEBX\tECX\tEDI\tEDX\tESI\n");
+                        for (int i = 0; i < sizeof(reg_vals_indices); i++) {
+                            uc_reg_read(uc, reg_vals_indices[i], &reg_val);
+                            printf("%x\t", reg_val);
+                            /*
+                            if (reg_val != 0) {
+                                temp_iat_info.thunk_rva = reg_val;
+                            }*/
+                            reg_val = 0;
+                        }
+                        temp_iat_info.thunk_rva = 0;
+                        //printf("\n");                                             
+                        return { temp_iat_info };
+                    }
+
+                    offset = r_eip;
+                    ea = base + offset;
+                    //printf("start5 address changed %x to %x\n", start_address, r_eip);
+                    start_address = current_address = r_eip;
+                    ins_count = 0;
+                    continue;
+                }
+                else {
+                    //ret�� ret8�� ���� ���ڸ� �޾� stack�� �����ϴ� case ���� ����
+
+                    uint64_t ret_adjustment = 0;
+
+
+                    if (ins->operand_count() != 0)
+                        ret_adjustment = ins->operand(0).imm;
+                    //printf("\n\n^^^^final stack %x^^^^\n\n", r_esp + ret_adjustment + bitoffset);// ret�� �����ϸ� +8�� �������
+
+                    // stack rsp�� ������ ��ġ�� ���۰� ������ ��ġ���� �ʴ� ��� => stack adjustment
+                    // jmp���� stack adjustment�� �Ͼ�� ��Ȳ�� ������ +8�Ǿ��� ��� & return �ּҰ� ó���� ��ġ���� �ʴ� ��� (ins.size + 1�� �ƴ� ���)
+                    // 6 => 5byte�� �پ�� ����̹Ƿ� call������ adjustment�� padding�� ���ÿ� ��Ÿ���� ���� ���� ins.size + 1�� �Ǿ����
+                    // jmp�� ���� ret�� ���� �ʱ� ������ �ʱ� rsp�� ���� �� - 8�� ��ġ�Ͽ�����
+                    // rsp�� ����Ű�� �ִ� return address�� ��ġ�� ���� ������ ��ġ���� �ʴ� ��� �ΰ��� ���̽� ���� padding �Ǵ� jmp
+                    // padding�� ���, rsp�� ��ȭ�� üũ (access �ÿ� üũ�Ͽ� �� ���� ���� �ٲ۴ٸ� padding)
+                    // jmp�� ������ �� + 8
+
+                    uint64_t return_address_in_stack;
+
+                    if (uc_mem_read(uc, (r_esp + ret_adjustment + bitoffset), &return_address_in_stack, sizeof(return_address_in_stack))) {
+                        printf("Failed to write emulation code to memory, quit!\n");
+                    }
+                    /*
+                    printf("return_address_in_stack is %x\n", return_address_in_stack);
+                    printf("next address and next_address+1 are %x & %x\n", next_address, next_address + 1);*/
+                    if (return_address_in_stack != next_address) { // �� ���̽��� padding�� jmp ��� ����
+                        if (return_address_in_stack == next_address + 1) {
+                            //printf("it is padded\n");
+                            temp_iat_info.padded = 1;
+                        }
+                        else {
+                            //printf("it is jump\n");
+                            temp_iat_info.is_jmp = 1;
+                            if (r_esp + bitoffset + ret_adjustment != sec_size + bitoffset) {// jmp�� ��� �� +8
+                                //printf("stack is adjusted\n");
+                                temp_iat_info.stack_adjustment = r_esp + bitoffset + ret_adjustment - sec_size - bitoffset;
+                            }
+                        }
+
+                    }
+                    else if (r_esp + bitoffset + ret_adjustment != sec_size) {
+                        //printf("stack is adjusted %x\n", r_esp + bitoffset + ret_adjustment - sec_size);
+                        temp_iat_info.stack_adjustment = r_esp + bitoffset + ret_adjustment - sec_size;
+                    }
+
+
+
+                    //printf("break value is %x\n", temp_esp_val1);
+                    temp_iat_info.dest_op = temp_esp_val1;
+                    break;
+                }
+            }
+
+            // Add instruction to list.
+            //
+            instructions.push_back(ins);
+        }
+
+        // Return an instruction stream of said instructions.
+        //
+        uc_close(uc);
+        cs_close(&handle_prev);
+        return { temp_iat_info };
+    }
+
+}

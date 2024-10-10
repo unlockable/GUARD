@@ -1,0 +1,756 @@
+#include "GUARD.hpp"
+#include <psapi.h>
+#include <Shlwapi.h>
+#include "disassembler.hpp"
+#include <map>
+#include <cstdint>
+#include <vtil/compiler>
+#include <vtil/common>
+#include <vtil/symex>
+#include <lifters/core>
+#include <lifters/amd64>
+#include <vector>
+
+namespace GUARD
+{
+    // Structure used to return raw import stub analysis information.
+    //
+    struct import_stub_analysis
+    {
+        uintptr_t thunk_rva;
+        uintptr_t dest_offset;
+        int32_t stack_adjustment;
+        bool padding;
+        bool is_jmp;
+    };
+    int bitoffset = 4; //32 4 64 8
+
+    // Attempts to generate structures from the provided call EA and instruction_stream of a VMP import stub.
+    // Returns empty {} if the import stub failed analysis (and therefore is an invalid stub).
+    //
+    std::optional<import_stub_analysis> analyze_import_stub( const instruction_stream& stream )
+    {
+        using namespace vtil;
+        printf("analysis start..\n");
+        // Lift the given instruction stream to VTIL.
+        //
+        basic_block* lifted_block = stream.lift();
+
+        // Ensure lifted block is valid.
+        //
+        if ( !lifted_block->is_complete() )
+            return {};
+
+        printf("It is completed block\n");
+        // Get the iterator just before the VMEXIT at the end.
+        // This is the baseline we'll be using to see how certain registers / stack variables changed during the stub.
+        //
+        vtil::basic_block::const_iterator iterator = std::prev( lifted_block->end() );
+
+        // Verify that the last instruction is a JMP to a register.
+        // 
+        if ( iterator->base->name != "jmp" || !iterator->operands[ 0 ].is_register() )
+            return {};
+
+        // Trace each variable that we'll be using to analyze the stub.
+        //
+        cached_tracer tracer;
+        symbolic::expression::reference dest_expression = tracer.trace( { iterator, iterator->operands[ 0 ].reg() } );
+        symbolic::expression::reference sp_expression = tracer.trace( { iterator, REG_SP } );
+        symbolic::expression::reference retaddr_expression = tracer.trace( { iterator, { sp_expression, 64 } } );
+
+        logger::log<logger::CON_CYN>("** Import stub analysis: dest_expression: %s sp_expression: %s retaddr_expression: %s\r\n", dest_expression, sp_expression, retaddr_expression);
+#ifdef _DEBUG
+        logger::log<logger::CON_CYN>( "** Import stub analysis: dest_expression: %s sp_expression: %s retaddr_expression: %s\r\n", dest_expression, sp_expression, retaddr_expression );
+#endif
+
+        // Check if the retaddr expression matches the [CONST] + CONST expression.
+        //
+        uint64_t thunk_rva = 0;
+        uint64_t dest_offset = 0;
+        {
+            using namespace symbolic::directive;
+
+            int64_t sign;
+            stack_vector<symbol_table_t, 2> results;
+            if ( ( sign = +1, fast_match( &results, V + U, dest_expression ) ) ||
+                 ( sign = -1, fast_match( &results, V - U, dest_expression ) ) ||
+                 ( sign = +0, fast_match( &results, V,     dest_expression ) ) )
+            {
+                auto& var = results.front().translate( V )->uid.get<symbolic::variable>();
+                if ( !var.is_memory() || !var.mem().decay()->is_constant() )
+                    return {};
+             
+                thunk_rva = *var.mem().decay()->get();
+                
+                if ( sign != 0 ) 
+                    dest_offset = sign * *results.front().translate( U )->get<true>();
+            }
+            else
+            {
+                return {};
+            }
+        }
+        
+        symbolic::expression::reference retaddr_sp_exp;
+
+        // Check if return address is padded.
+        // TODO: rewrite this in a nicer way.
+        //
+        bool pad = false;
+        {
+            symbolic::expression::reference lhs = retaddr_expression->lhs;
+            symbolic::expression::reference rhs = retaddr_expression->rhs;
+
+            if ( lhs && rhs && lhs->is_variable() && rhs->is_constant() )
+            {
+                uint32_t constant = *rhs->get<uint32_t>();
+
+                if ( constant != 1 )
+                    logger::log<logger::CON_PRP>( "** Warning: Unexpected value for padding: 0x%lx\r\n", constant );
+
+                pad = true;
+
+                // Set retaddr sp exp to [lhs].
+                //
+                retaddr_sp_exp = lhs->uid.get<symbolic::variable>().mem().base.base;
+            }
+            else
+                retaddr_sp_exp = retaddr_expression->uid.get<symbolic::variable>().mem().base.base;
+        }
+        logger::log<logger::CON_CYN>("** Import stub analysis: retaddr_sp_exp: %s\r\n", retaddr_sp_exp);
+#ifdef _DEBUG
+        logger::log<logger::CON_CYN>( "** Import stub analysis: retaddr_sp_exp: %s\r\n", retaddr_sp_exp );
+#endif
+
+        // Subtract initial SP from final SP to get the SP adjustment.
+        //
+        symbolic::expression stack_adjustment_expr = ( sp_expression - symbolic::CTX( lifted_block->begin() )[ REG_SP ] ).simplify( true );
+        logger::log<logger::CON_CYN>("** Import stub analysis: stack_adjustment_expr: %s\r\n", stack_adjustment_expr);
+#ifdef _DEBUG
+        logger::log<logger::CON_CYN>( "** Import stub analysis: stack_adjustment_expr: %s\r\n", stack_adjustment_expr );
+#endif
+
+        // Check if is jmp.
+        //
+        bool is_jmp = retaddr_sp_exp->equals( *sp_expression ) && *stack_adjustment_expr.get<int32_t>() >= 8;
+        logger::log<logger::CON_CYN>("** Import stub analysis: is_jmp: %d\r\n", is_jmp);
+#ifdef _DEBUG
+        logger::log<logger::CON_CYN>( "** Import stub analysis: is_jmp: %d\r\n", is_jmp );
+#endif
+
+        if ( !stack_adjustment_expr.is_constant() )
+            return {};
+
+        // If is jump, expect stack adjustment of -0x8 to account for the initial call stub.
+        //
+        int32_t sp_adjustment = *stack_adjustment_expr.get<int32_t>() - ( is_jmp ? 8 : 0 );
+        // Construct the analysis result object.
+        //
+        return import_stub_analysis { thunk_rva, dest_offset, sp_adjustment, pad, is_jmp };
+    }
+
+    // Scans the specified code range for any import calls and imports.
+    // resolved_imports is a map of { import thunk rva, import structure }.
+    //
+    bool GUARD::scan_for_imports( uint64_t rva, size_t code_size, std::map<uint64_t, resolved_import>& resolved_imports, std::vector<import_call>& import_calls, uint32_t flags )
+    {
+        uint8_t* local_module_bytes = ( uint8_t* )target_module_view->local_module.data();
+        size_t size = code_size;
+
+        uint8_t* code_start = local_module_bytes + rva;
+        uint64_t start_offset = rva;
+        uint64_t offset = start_offset;
+        std::vector <uint64_t> jmp_call;
+        std::map<uint64_t, bool> call_visited;
+
+        auto raw_nt = target_module_view->local_module.get_image()->get_nt_headers();
+        uint32_t image_base = raw_nt->optional_header.image_base;
+        
+        // Retain the previously disassembled instruction for future use.
+        //
+        std::optional<instruction> previous_instruction = {};
+
+
+        csh handle_prev;
+        cs_insn* insn_jmp_fetch, *insn_call_fetch;
+        uint64_t count;
+        size_t size_prev_fetch = 0xFFFFFFFFFFFFFFFFull;;
+
+        if (cs_open(CS_ARCH_X86, CS_MODE_32, &handle_prev)) {
+            printf("ERROR: Failed to initialize engine!\n");
+        }
+        cs_option(handle_prev, CS_OPT_DETAIL, CS_OPT_ON);
+
+        // While iterative disassembly is successful.
+        //
+        printf("Start Memory Search To Find APIs\n");
+        int test_cnt = 0;
+        while ( true )
+        {
+            // Check if we're within bounds.
+            //
+            if (offset >= start_offset + code_size) {
+                printf("offset is over\n");
+                break;
+            }
+            
+
+            // In case disassembly failed (due to invalid instructions), try to continue by incrementing offset.
+            //
+            if ( !cs_disasm_iter( disassembler::get().get_handle(), ( const uint8_t** )&code_start, &size, &offset, disassembler::get().get_insn() ) )
+            {
+                offset++;
+                code_start++;
+
+                continue;
+            }
+            instruction ins = { disassembler::get().get_insn() };
+            // In order to scan mutated code without failing, we are following 1 and 2 byte absolute jumps.
+            //
+            
+            if ( ins.ins.id == X86_INS_JMP
+                && ins.operand_type( 0 ) == X86_OP_IMM )
+            {
+                auto section = target_module_view->local_module.get_image()->rva_to_section(ins.operand(0).imm);
+                
+                if (section->name != NULL) {
+
+                    jmp_call.push_back(ins.operand(0).imm);
+
+                }
+                uint32_t jump_offset = ins.operand( 0 ).imm - ( ins.ins.address + ins.ins.size );
+                
+                if ( jump_offset == 1 || jump_offset == 2 )
+                {
+                    offset += jump_offset;
+                    code_start += jump_offset;
+
+                    previous_instruction = ins;
+
+                    continue;
+                }
+            }
+            else if (ins.ins.id == X86_INS_PUSH && ins.operand_type(0) == X86_OP_IMM) {
+                //printf("ssss %x : %s %s : %x\n", ins.ins.address, ins.ins.mnemonic, ins.ins.op_str, ins.operand(0).imm); // should solve duplication problem easily
+                auto section = target_module_view->local_module.get_image()->rva_to_section(ins.operand(0).imm - image_base); // push opcodes include image bases
+                if (section->name != NULL) {
+                    
+                    jmp_call.push_back(ins.operand(0).imm - image_base);
+
+                }
+            }
+            // If the instruction is a relative ( E8 ) call.
+            //
+            uint64_t call_target_offset = ins.operand(0).imm;
+            auto section = target_module_view->local_module.get_image()->rva_to_section(call_target_offset);
+            
+            if (section->name != NULL && ins.ins.id == X86_INS_CALL && ins.operand_type(0) == X86_OP_IMM && ins.ins.bytes[0] == 0xE8 && (!strcmp(section->name, ".vmp0") || !strcmp(section->name, ".vmp1"))) {
+                call_visited.insert({ ins.ins.address, true });
+                //printf("\n###target address is %x  and sec name is %s\n", ins.operand(0).imm, section->name);
+                printf("\n\n*****target ins address is %x\n\n", ins.ins.address);
+
+                /*
+                test_cnt++;
+                if (test_cnt == 20)
+                    break;*/
+                /*
+                if (ins.ins.address != 0x2D03)
+                    continue;*/
+                uint8_t* call_target = local_module_bytes + call_target_offset;
+                // Ensure that the call destination is valid memory in the first place.
+                //
+                if (!IsBadReadPtr(call_target, 1))
+                {
+                    // Disassemble at the call target.
+                    // Max 25 instructions, in order to filter out invalid calls.
+                    //
+                    printf("target offset is %x \n", call_target_offset);
+
+                    uint64_t next_address_offset = ins.ins.address + ins.ins.size;
+                    //printf("next_address_offset is %x\n", next_address_offset);
+                    
+                    iat_info iat_struct_info = disassembler::get().disassemble_32((uint64_t)local_module_bytes, call_target_offset, &target_module_view, start_offset, next_address_offset,
+                        code_size, disassembler_take_unconditional_imm, 125);
+                    uintptr_t target_ea = *(uint32_t*)(local_module_bytes + iat_struct_info.thunk_rva) + iat_struct_info.dest_op;
+
+                    if (iat_struct_info.thunk_rva == 0) {
+                        printf("it is failed to find thunk rva\n");
+                        continue;
+                    }
+                    // If it doesn't already exist within the map, insert the import.
+                    // 
+                    printf("target ea is %x\n", target_ea);
+
+                    const resolved_import* referenced_import = &resolved_imports.insert({ iat_struct_info.thunk_rva, { iat_struct_info.thunk_rva, target_ea } }).first->second;
+                    // Record the call to the import.
+                    printf("Target API is successfully found\n");
+                    printf("its result is stack_adjustment : %d and padded %d and is_jmp %d and thunk is %x\n", iat_struct_info.stack_adjustment, iat_struct_info.padded, iat_struct_info.is_jmp, iat_struct_info.thunk_rva);
+                    import_calls.push_back({ ins.ins.address, referenced_import, iat_struct_info.stack_adjustment, iat_struct_info.padded, iat_struct_info.is_jmp, previous_instruction });
+
+                    // If the call is a jump, and has no backwards (push) padding, it must be padded after the stub.
+                    // Because jumps don't return, this information won't be provided to us by the analysis, so we have
+                    // to skip the next byte to prevent potentially invalid disassembly.
+
+                }
+            }
+            previous_instruction = ins;
+        }
+
+        int i = 0;
+        /*
+        printf("start");
+        printf("JMP size is %d\n", jmp_call.size());*/
+        while (i < jmp_call.size()) {     
+            uint8_t* ea = jmp_call[i] + local_module_bytes;
+            size_t size = 0xFFFFFFFFFFFFFFFFull;
+            if (!cs_disasm_iter(disassembler::get().get_handle(), (const uint8_t**)&ea, &size, &jmp_call[i], disassembler::get().get_insn()))
+            {
+                i++;
+                continue;
+            }
+            instruction ins = { disassembler::get().get_insn() };
+            //printf("jmp target is %x : %s %s\n", ins.ins.address, ins.ins.mnemonic, ins.ins.op_str);
+            //auto section = target_module_view->local_module.get_image()->rva_to_section(ins.ins.address);
+            
+            if (ins.ins.id == X86_INS_CALL && ins.ins.bytes[0] == 0xE8 && call_visited.find(ins.ins.address) == call_visited.end()) {
+                uint64_t call_target_offset = ins.operand(0).imm;
+                printf("\n\n*****target ins address is %x\n", call_target_offset, ins.ins.address);
+                
+                uint64_t next_address_offset = ins.ins.address + ins.ins.size;
+                //printf("next_address_offset is %x\n", next_address_offset);
+
+
+                iat_info iat_struct_info = disassembler::get().disassemble_32((uint64_t)local_module_bytes, call_target_offset, &target_module_view, start_offset, next_address_offset,
+                    code_size, disassembler_take_unconditional_imm, 125);
+                uintptr_t target_ea = *(uintptr_t*)(local_module_bytes + iat_struct_info.thunk_rva) + iat_struct_info.dest_op;
+
+                // If it doesn't already exist within the map, insert the import.
+                // 
+                printf("target ea is %x\n", target_ea);
+
+                const resolved_import* referenced_import = &resolved_imports.insert({ iat_struct_info.thunk_rva, { iat_struct_info.thunk_rva, target_ea } }).first->second;
+                // Record the call to the import.
+                printf("its result is stack_adjustment : %d and padded %d and is_jmp %d and thunk is %x\n", iat_struct_info.stack_adjustment, iat_struct_info.padded, iat_struct_info.is_jmp, iat_struct_info.thunk_rva);
+                import_calls.push_back({ ins.ins.address, referenced_import, iat_struct_info.stack_adjustment, iat_struct_info.padded, iat_struct_info.is_jmp, previous_instruction });
+            }
+            else if (ins.ins.id == X86_INS_PUSH && ins.ins.size == 1) { // stack alignment 상황 고려 다음 address parse
+                uint8_t* push_next_ea = ins.ins.address + local_module_bytes + 1;
+                uint64_t push_next_address = ins.ins.address + 1;
+                if (!cs_disasm_iter(disassembler::get().get_handle(), (const uint8_t**)&push_next_ea, &size, &push_next_address, disassembler::get().get_insn()))
+                {
+                    i++;
+                    continue;
+                }
+                instruction push_next_ins = { disassembler::get().get_insn() };
+                if (push_next_ins.ins.id == X86_INS_CALL && push_next_ins.ins.bytes[0] == 0xE8 && call_visited.find(push_next_ins.ins.address) == call_visited.end()) {
+                    uint64_t push_next_call_target_offset = push_next_ins.operand(0).imm;
+                    
+                    printf("\n\n*****target ins address is %x\n", push_next_call_target_offset);
+
+                    uint64_t push_next_address_offset = push_next_ins.ins.address + push_next_ins.ins.size;
+                    //printf("next_address_offset is %x\n", push_next_address_offset);
+
+
+                    iat_info push_next_iat_struct_info = disassembler::get().disassemble_32((uint64_t)local_module_bytes, push_next_call_target_offset, 
+                        &target_module_view, start_offset, push_next_address_offset, code_size, disassembler_take_unconditional_imm, 125);
+                    uintptr_t push_next_target_ea = *(uintptr_t*)(local_module_bytes + push_next_iat_struct_info.thunk_rva) + push_next_iat_struct_info.dest_op;
+
+                    // If it doesn't already exist within the map, insert the import.
+                    // 
+                    printf("target ea is %x\n", push_next_target_ea);
+
+                    const resolved_import* referenced_import = &resolved_imports.insert({ push_next_iat_struct_info.thunk_rva, { push_next_iat_struct_info.thunk_rva, push_next_target_ea } }).first->second;
+                    // Record the call to the import.
+                    printf("its result is stack_adjustment : %d and padded %d and is_jmp %d and thunk is %x\n", push_next_iat_struct_info.stack_adjustment, push_next_iat_struct_info.padded, 
+                        push_next_iat_struct_info.is_jmp, push_next_iat_struct_info.thunk_rva);
+                    import_calls.push_back({ push_next_ins.ins.address, referenced_import, push_next_iat_struct_info.stack_adjustment, push_next_iat_struct_info.padded, push_next_iat_struct_info.is_jmp, ins });
+                }
+            }
+            previous_instruction = ins;
+            
+            i++;
+        }
+
+        return true;
+    }
+
+    // Scans all executable sections of the image for any import calls and imports.
+    //
+    bool GUARD::scan_for_imports( std::map<uint64_t, resolved_import>& resolved_imports, std::vector<import_call>& import_calls, uint32_t ep_rva, uint32_t flags)
+    {
+        using namespace win;
+
+        bool failed = false;
+
+        nt_headers_t<false>* nt = target_module_view->local_module.get_image()->get_nt_headers();
+
+        // Enumerate image sections.
+        //
+        for ( int i = 0; i < nt->file_header.num_sections; i++ )
+        {
+            section_header_t* section = nt->get_section( i );
+
+            if (section->characteristics.mem_read && section->characteristics.mem_execute) {
+                if (ep_rva >= section->virtual_address && ep_rva <= section->virtual_address + section->virtual_size) {
+                    printf("start scan start address :%x and size is %x\n", section->virtual_address, section->virtual_size);
+                    failed |= !scan_for_imports(section->virtual_address, section->virtual_size, resolved_imports, import_calls, flags);
+                }
+            }
+        }
+
+        return !failed;
+    }
+
+    // Attempts to generate a stub in a code cave which jmps to the given thunk.
+    // Returns the stub rva.
+    //
+    std::optional<uint32_t> GUARD::generate_stub( uint32_t rva, remote_ea_t thunk )
+    {
+        // Save all stubs so we don't re-create them on each call.
+        //
+        static std::map<remote_ea_t, uint32_t> stubs;
+
+        // If the stub was already created, just return its rva.
+        //
+        auto it = stubs.find( thunk );
+        if ( it != stubs.end() )
+            return it->second;
+
+        // We need 6 bytes for a thunk call.
+        //
+        const uint32_t req_len = 6;
+
+        // Increase the section size.
+        //
+        auto section = target_module_view->local_module.get_image()->rva_to_section( rva );
+        uint32_t stub_rva = section->virtual_address + section->virtual_size;
+        section->virtual_size += req_len;
+        //printf("stub rva is %x\n", stub_rva);
+        // TODO: Handle if there is no more padding left in the section to overwrite.....
+        //
+        // ...
+
+        // If no code-cave found, return empty {}.
+        //
+        if ( !stub_rva )
+            return {};
+
+        // Assemble a jump.
+        //
+        std::vector<uint8_t> jump = vtil::amd64::assemble( vtil::format::str( "jmp [0x%p]", thunk ), target_module_view->module_base + stub_rva );
+
+        // Sanity-check the size.
+        //
+        if ( jump.size() > 6 )
+            return {};
+
+        // Copy the assembled jump to the code-cave.
+        //
+        memcpy( target_module_view->local_module.data() + stub_rva, jump.data(), jump.size() );
+
+        // Add the generated stub to the list for future use.
+        //
+        stubs.insert( { thunk, stub_rva } );
+
+        return stub_rva;
+    }
+
+    // Attempts to convert the provided call to the VMP import stub to a direct import thunk call to the specified remote thunk ea.
+    //
+    bool GUARD::convert_local_call( const import_call& call, remote_ea_t thunk )
+    {
+        uint8_t* local_module_bytes = ( uint8_t* )target_module_view->local_module.data();
+
+        uint32_t fill_rva = 0;
+        size_t fill_size = 0;
+
+        // If the import stub call inline adjusts the stack, we must verify that the instruction
+        // before the stub call is indeed a PUSH.
+        //
+        // In VMP3, the stack is only ever adjusted by a single 64-bit PUSH.
+        //
+        if ( call.stack_adjustment == bitoffset )
+        {
+            if ( call.prev_instruction && call.prev_instruction->ins.id == X86_INS_PUSH && call.prev_instruction->operand_type( 0 ) == X86_OP_REG && call.prev_instruction->ins.size == 1)
+            {
+                // It is indeed a valid VMP-injected push.
+                // We can NOP it later, and mark it as the starting point for our fill address.
+                //
+                fill_rva = call.prev_instruction->ins.address;
+                fill_size += call.prev_instruction->ins.size;
+            }
+            else if (call.prev_instruction->ins.size >= 2) { // vmp3.6 >
+                //printf("fill rva is %x\n", call.prev_instruction->ins.address + 1);
+                fill_rva = call.prev_instruction->ins.address + call.prev_instruction->ins.size - 1;
+                fill_size += 1;//call.prev_instruction->ins.size;
+            }
+            else
+            {                
+                vtil::logger::log<vtil::logger::CON_RED>( "!! Stack adjustment failed for call @ RVA 0x%llx for thunk @ 0x%llx\r\n", call.call_rva, thunk );
+                return false;
+            }
+        }
+
+        //printf("call prev ins size is %d and fill_rva is %x and call.call_rva is %x \n", call.prev_instruction->ins.size, fill_rva, call.call_rva);
+        uint8_t* call_ea = local_module_bytes + call.call_rva;
+
+        // Disassemble instruction at the call rva.
+        //
+        //printf("call ea is %x and call rVa is %x\n");
+        auto instructions = vtil::amd64::disasm( call_ea, call.call_rva );
+
+        // Ensure disassembly succeeded.
+        //
+        if ( instructions.empty() )
+        {
+            vtil::logger::log<vtil::logger::CON_RED>( "!! Disassembly failed for call @ RVA 0x%llx for thunk @ 0x%llx\r\n", call.call_rva, thunk );
+            return false;
+        }
+
+        // If it's a jump, we can increase fill size by 1, if we haven't already filled using a PUSH.
+        // This is because thunk jumps must be 5 bytes, so VMP can insert a junk pad byte after its 4 byte stub.
+        //
+        if ( fill_size == 0 && call.is_jmp )
+            fill_size++;
+
+        // If there's no fill rva selected, set it as the beginning of the disassembled instructions.
+        //
+        if ( fill_rva == 0 )
+            fill_rva = instructions[ 0 ].address;
+        
+        // Account for these instructions for the fill size.
+        //
+        for ( auto instruction : instructions )
+            fill_size += instruction.bytes.size();
+
+        // If padded, increase fill size by 1.
+        //
+        fill_size += call.padded ? 1 : 0;
+
+        // Now we must inject a call to the newly-fixed thunk.
+        //
+        // We assemble this call as if we're in the target process address-space.
+        // This is because we want to give the assembler the freedom to potentially make a non-relative call if it desires.
+        //
+        printf("fill_rva is %x and target_module_view->module_base is %x\n", target_module_view->module_base, fill_rva);
+        printf("converted_data thunk is %x and va is %x\n", thunk, target_module_view->module_base + fill_rva);
+        std::vector<uint8_t> converted_call = vtil::amd64::assemble( vtil::format::str( "%s [0x%p]", call.is_jmp ? "jmp" : "call", thunk ), target_module_view->module_base + fill_rva );
+
+        // Ensure assembly succeeded.
+        //
+        if ( converted_call.empty() )
+        {
+            vtil::logger::log<vtil::logger::CON_RED>( "!! Assembly failed for call @ RVA 0x%llx for thunk @ 0x%llx\r\n", call.call_rva, thunk );
+            return false;
+        }
+
+        // Ensure we have enough bytes to fill.
+        //
+        if ( converted_call.size() > fill_size )
+        {
+            // If we don't have enough bytes, we can try to dispatch the call via a stub.
+            // Try to generate this stub in a codecave.
+            //
+            if ( std::optional<uint32_t> stub_rva = generate_stub( fill_rva, thunk ) )
+            {
+                // Successful, we found a suitable code-cave and generated a stub.
+                // Now replace the call with a dispatched call (or jmp) to the stub.
+                //
+                converted_call = vtil::amd64::assemble( vtil::format::str( "%s 0x%p", call.is_jmp ? "jmp" : "call", target_module_view->module_base + *stub_rva ), target_module_view->module_base + fill_rva );
+            }
+        }
+
+        // Ensure again we have enough bytes to fill.
+        //
+        if ( converted_call.size() > fill_size )
+        {
+            vtil::logger::log<vtil::logger::CON_RED>( "!! Insufficient bytes [have %d, need %d] for call @ RVA 0x%llx for thunk @ 0x%llx\r\n", fill_size, converted_call.size(), call.call_rva, thunk );
+            return false;
+        }
+
+        // NOP the fill bytes and copy the converted call in.
+        
+        printf("convered call data is %x\n", converted_call.data());
+        BYTE* bytepointer = converted_call.data();
+        
+        for (int i = 0; i < converted_call.size(); i++) {
+            printf("%x ", bytepointer[i]);
+        }
+        printf("\n");
+        memset( local_module_bytes + fill_rva, 0x90, fill_size );
+        memcpy( local_module_bytes + fill_rva, converted_call.data(), converted_call.size() );
+
+        return true;
+    }
+
+    // Searches for a module where the provided remote ea is within the module's address space, then returns a module_view of that module.
+    //
+    std::optional<module_view> GUARD::view_from_base( remote_ea_t base ) const
+    {
+        // Find the module by base.
+        //
+        auto it = process_modules.find( base );
+        // Return empty {} if not found.
+        //
+
+        if ( it == process_modules.end() )
+            return {};
+        // Construct module_view.
+        //
+        return { { process_id, it->second.first, "test", base, it->second.second}};
+    }
+
+    // Retrieves the module base from the given remote ea.
+    //
+    std::optional<remote_ea_t> GUARD::base_from_ea( remote_ea_t ea ) const
+    {
+        // Enumerate process modules.
+        //
+        for ( auto& [base, info] : process_modules )
+        {
+            // If within bounds, return module base.
+            //
+            unsigned int size = (unsigned int)info.second;
+            unsigned int new_ea = (unsigned int)ea;
+            unsigned int new_base = (unsigned int)base;
+            unsigned int upperbound = new_base + size;
+            //printf("target ea is %x and current base is %x and info.second is %x and result is %x\n", (unsigned int)ea, (unsigned int)base, (unsigned int)info.second, (unsigned int)base + (unsigned int)info.second);
+            //printf("#### boolean 1 : %d and boolean 2 : %d\n", ea >= base, ea < base + info.second);
+            if (new_ea >= new_base && new_ea < new_base + size) {
+                //printf("return base value : %x\n", base);
+                return base;
+            }
+        }
+
+        // If none found, return empty {}.
+        //
+        return {};
+    }
+
+    // Creates a GUARD class from the given process id and target module name.
+    // If module_name is empty "", the process module is used.
+    // If the process cannot be opened for some reason or the module cannot be found, returns empty {}.
+    //
+    std::unique_ptr<GUARD> GUARD::from_pid( uint32_t process_id, const std::string& module_name )
+    {
+        std::unique_ptr<GUARD> result = {};
+
+        HMODULE process_modules[ 1024 ] = {};
+
+        // TODO: replace PROCESS_ALL_ACCESS with something more specific.
+        //
+        HANDLE process_handle = OpenProcess( PROCESS_ALL_ACCESS, FALSE, process_id );
+        if ( process_handle == NULL )
+            return {};
+
+        // Retrieves the module base address and size, in that order, in a pair.
+        //
+        auto get_module_info = [&]( HMODULE target_module ) -> std::pair<uintptr_t, size_t>
+        {
+            MODULEINFO info = {};
+            if ( !GetModuleInformation( process_handle, target_module, &info, sizeof( info ) ) )
+                return { 0, 0 };
+
+            printf("module successfully loaded and address is %x and size of image is %x\n", info.lpBaseOfDll, info.SizeOfImage);
+            return { ( uintptr_t )info.lpBaseOfDll, info.SizeOfImage };
+        };
+
+        // Do ... While( 0 ) "loop" for easy error wrapping.
+        //
+        do
+        {
+            // Try to get the process image file name.
+            //
+            char process_image_path[ MAX_PATH ] = {};
+            DWORD process_image_path_size = sizeof( process_image_path );
+            if ( !QueryFullProcessImageNameA( process_handle, 0, process_image_path, &process_image_path_size ) )
+                break;
+
+            const char* process_image_name = PathFindFileNameA( process_image_path );
+
+            // Map of process modules, for later class construction.
+            //
+            std::map<remote_ea_t, std::pair<std::string, size_t>> process_modules_map;
+            std::map<std::string, std::string> process_path_map;
+            // Info of the target module.
+            //
+            std::string target_module_name;
+            std::string target_path_name;
+            std::pair<uintptr_t, size_t> target_module_info = {};
+            bool target_module_found = false;
+
+            // Enumerate through the process modules list.
+            //
+            DWORD process_modules_size;
+            if ( EnumProcessModulesEx( process_handle, process_modules, sizeof( process_modules ), &process_modules_size, LIST_MODULES_ALL) )
+            {
+                // Loop through each module.
+                //
+                for ( int i = 0; i < ( process_modules_size / sizeof( HMODULE ) ); i++ )
+                {
+                    HMODULE curr_module = process_modules[ i ];
+
+                    // Get the module base address and size.
+                    //
+                    
+                    std::pair<uintptr_t, size_t> curr_module_info = get_module_info( curr_module );
+                    // Get the module name.
+                    //
+                    char module_base_name[ 128 ] = {};
+                    char module_path_name[MAX_PATH] = {};
+                    if ( GetModuleBaseNameA( process_handle, curr_module, module_base_name, sizeof( module_base_name ) ) )
+                    {
+                        // Add the module to the map.
+                        //
+                        //IMAGE_DOS_HEADER* DOSH = (IMAGE_DOS_HEADER*)process_modules[i];
+                        //PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((DWORD_PTR)imageBase + dosHeaders->e_lfanew);
+                        //strcpy(module_base_name, path);
+                        process_modules_map.insert( { curr_module_info.first, { module_base_name, curr_module_info.second } } );
+
+                        if (GetModuleFileNameExA(process_handle, process_modules[i], module_path_name, sizeof(module_path_name)) == 0)
+                        {
+                            int ret = GetLastError();
+                            fprintf(stderr, "GetModuleFileName failed, error = %d\n", ret);
+                            // Return or however you want to handle an error.
+                        }
+                        else {
+                            printf("module path is %s\n", module_path_name);
+                        }
+
+                        process_path_map.insert({ module_base_name , std::string(module_path_name) });
+                        //printf("&&&&&&&&&&&&&&&&&module name : %s and %s\n", module_base_name, module_path_name);
+                        // If we're looking for the process module, compare module name to image base name.
+                        // Otherwise, compare the module name to the provided target module name in the argument.
+                        //
+                        
+                        if ( !target_module_found
+                            && ( module_name.empty() && _stricmp( module_base_name, process_image_name ) == 0 )
+                            || ( std::string( module_base_name ) == module_name ) )
+                        {
+                            target_module_info = curr_module_info;
+                            target_module_name = module_base_name;
+                            target_path_name = module_path_name;
+                            target_module_found = true;
+                        }
+                    }
+                }
+            }
+
+            // Verify that we actually found the module.
+            //
+            if ( !target_module_found )
+                break;
+
+            // Construct the object.
+            //
+            result = std::make_unique<GUARD>( process_id, process_modules_map, process_path_map, std::make_unique<module_view>( process_id, target_module_name, target_path_name, target_module_info.first, target_module_info.second ), std::string { process_image_path } );
+            
+        } while ( 0 );
+
+        // Close handle and return the constructed object.
+        //
+        CloseHandle( process_handle );
+        return result;
+    }
+}
