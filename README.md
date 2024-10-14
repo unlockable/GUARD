@@ -18,7 +18,6 @@ If you prefer a particular method of file sharing or have a designated platform 
 
 Thank you for considering our submission and for your attention to this matter. We are eagerly looking forward to the opportunity to present our work.
 
-==============================================================================================================================================================
 
 # Usage
 
