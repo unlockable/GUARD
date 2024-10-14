@@ -1,3 +1,5 @@
+#GUARD
+
 GUARD (Generic Unpacking with API Restoration and De-obfuscation) temporary repository.
 
 As part of the submission (double-blind review), we would like to share the source files, experiment files, and results for review purposes. 
@@ -17,6 +19,8 @@ If you prefer a particular method of file sharing or have a designated platform 
 Thank you for considering our submission and for your attention to this matter. We are eagerly looking forward to the opportunity to present our work.
 
 ==============================================================================================================================================================
+
+#Usage
 
 Current GUARD distributed version works with Pin v3.22
 
@@ -43,3 +47,15 @@ After that, simply execute GUARD with inputs
 ```bash
 GUARD.exe <Target PID> "" -ep=0xOEP ""
 ```
+
+#Acknowledgements
+1. Pin tool implementation
+   - To implement OEP search, we refered paper
+   - Lee, Young Bi, Jae Hyuk Suk, and Dong Hoon Lee. "Bypassing anti-analysis of commercial protector methods using DBI tools." IEEE Access 9 (2021): 7655-7673.
+   - And, to bypass heaven's gate technique, which is default anti-debugging method of < v3.6 VMProtect, we refered and used implementation of following paper work
+   - Hwang, Seon-Jin, et al. "Bypassing Heaven’s Gate Technique Using Black-Box Testing." Sensors 23.23 (2023): 9417.
+   - https://github.com/unlockable/Bypassing-Heaven-s-Gate
+
+2. IAT Restoration
+   - To implement IAT search and restoration, we used VMPDump as base code. We changed its implementation that use Vtil to unicorn based and implemented sIAT and other functionalities
+   - https://github.com/0xnobody/vmpdump
