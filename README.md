@@ -1,4 +1,4 @@
-#GUARD
+# GUARD
 
 GUARD (Generic Unpacking with API Restoration and De-obfuscation) temporary repository.
 
@@ -20,7 +20,7 @@ Thank you for considering our submission and for your attention to this matter. 
 
 ==============================================================================================================================================================
 
-#Usage
+# Usage
 
 Current GUARD distributed version works with Pin v3.22
 
@@ -48,7 +48,7 @@ After that, simply execute GUARD with inputs
 GUARD.exe <Target PID> "" -ep=0xOEP ""
 ```
 
-#Acknowledgements
+# Acknowledgements
 1. Pin tool implementation
    - To implement OEP search, we refered paper
    - Lee, Young Bi, Jae Hyuk Suk, and Dong Hoon Lee. "Bypassing anti-analysis of commercial protector methods using DBI tools." IEEE Access 9 (2021): 7655-7673.
