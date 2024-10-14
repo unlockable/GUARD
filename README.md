@@ -26,7 +26,7 @@ We use Pin in order to automatically execute target file until OEP address.
 
 ```bash
 pin.exe -t <Pin DLL> -o <Target File Path>
-
+```
 If you want to use other analysis tools like x64dbg, you can use its scripts or manually trace instructions until OEP.
 
 For GUARD executable inputs, you need PID of target process, and OEP address.
@@ -37,9 +37,9 @@ To build GUARD executable, we used Visual Studio 17 2022.
 mkdir build && cd build
 cmake -G "Visual Studio 17 2022" ..
 cmake --build . --config Release
-
+```
 After that, simply execute GUARD with inputs
 
 ```bash
 GUARD.exe <Target PID> "" -ep=0xOEP ""
-
+```
