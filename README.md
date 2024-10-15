@@ -10,7 +10,7 @@ To facilitate the review, we have prepared the following items for submission:
 
 Source files, Experiment Files and Results.
 
-We believe that sharing the source code after acceptance will provide the research community with a deeper understanding of the underlying implementation and enable further exploration and collaboration.
+We believe that sharing the source code will provide the research community with a deeper understanding of the underlying implementation and enable further exploration and collaboration.
 
 Please let me know if there are any specific guidelines or instructions regarding the submission of these files. 
 
