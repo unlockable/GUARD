@@ -51,7 +51,7 @@ GUARD.exe <Target PID> "" -ep=0xOEP ""
 1. Pin tool implementation
    - To implement OEP search, we refered paper
    - Lee, Young Bi, Jae Hyuk Suk, and Dong Hoon Lee. "Bypassing anti-analysis of commercial protector methods using DBI tools." IEEE Access 9 (2021): 7655-7673.
-   - And, to bypass heaven's gate technique, which is default anti-debugging method of < v3.6 VMProtect, we refered and used implementation of following paper work
+   - And, to bypass heaven's gate technique, which is default anti-debugging method of < v3.6 VMProtect, we refered to and used implementation of following paper work
    - Hwang, Seon-Jin, et al. "Bypassing Heaven’s Gate Technique Using Black-Box Testing." Sensors 23.23 (2023): 9417.
    - https://github.com/unlockable/Bypassing-Heaven-s-Gate
 
